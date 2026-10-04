@@ -225,6 +225,67 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
 // 2. API ENDPOINTS
 // ----------------------------------------------------------------------
 
+// Get direct upload credentials
+app.get('/api/upload-credentials', (req: Request, res: Response) => {
+  const creds = getTelegramCredentials();
+  return res.json({
+    success: true,
+    token: creds.token,
+    chatId: creds.chatId
+  });
+});
+
+// Record completed direct client upload
+app.post('/api/record-file', async (req: Request, res: Response) => {
+  try {
+    const { fileId, messageId, chatId, originalFilename, fileSize, mimeType } = req.body;
+
+    if (!fileId || !originalFilename) {
+      return res.status(400).json({ success: false, error: 'بيانات التسجيل غير مكتملة' });
+    }
+
+    const publicId = generatePublicId();
+    const { extension } = getFileExtensionAndName(originalFilename);
+
+    const createdIso = new Date().toISOString();
+
+    const fileRecord: StoredFile = {
+      id: publicId,
+      original_filename: originalFilename,
+      file_extension: extension,
+      mime_type: mimeType || 'application/octet-stream',
+      file_size: Number(fileSize) || 0,
+      telegram_chat_id: chatId || '-1003839994672',
+      telegram_message_id: Number(messageId) || 0,
+      telegram_file_id: fileId,
+      created_at: createdIso
+    };
+
+    await saveFileRecord(fileRecord);
+
+    const protocol = req.protocol || 'http';
+    const host = req.get('host') || 'localhost:3000';
+    const directUrl = `${protocol}://${host}/f/${publicId}${extension}`;
+
+    return res.json({
+      success: true,
+      file: {
+        id: publicId,
+        originalFilename: fileRecord.original_filename,
+        fileExtension: fileRecord.file_extension,
+        mimeType: fileRecord.mime_type,
+        fileSize: fileRecord.file_size,
+        createdAt: fileRecord.created_at,
+        directUrl: directUrl,
+        relativePath: `/f/${publicId}${extension}`
+      }
+    });
+  } catch (err: any) {
+    console.error('Error recording file:', err);
+    return res.status(500).json({ success: false, error: 'فشل تسجيل بيانات الملف' });
+  }
+});
+
 // Chunked Upload: 1. Initialize
 app.post('/api/upload/init', (req: Request, res: Response) => {
   try {

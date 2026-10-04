@@ -219,108 +219,125 @@ export default function App() {
     setUploadProgress(1);
     setUploadError(null);
 
-    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks (bypasses serverless payload limits)
-    const fileSize = fileToUpload.size;
+    const file = fileToUpload;
 
     try {
-      if (fileSize <= 3 * 1024 * 1024) {
-        // Direct single upload for small files
+      // 1. Fetch direct upload credentials
+      let creds: { token?: string; chatId?: string } = {};
+      try {
+        const credsRes = await fetch('/api/upload-credentials');
+        const credsData = await credsRes.json();
+        if (credsData.success && credsData.token) {
+          creds = credsData;
+        }
+      } catch (e) {
+        console.warn('Failed to fetch credentials, falling back to server route:', e);
+      }
+
+      if (creds.token && creds.chatId) {
+        // Direct Client-to-Telegram upload (bypasses ALL Vercel serverless limits, up to 2GB per file)
         const formData = new FormData();
-        formData.append('file', fileToUpload);
+        formData.append('chat_id', creds.chatId);
+        formData.append('document', file, file.name);
 
-        const progressInterval = setInterval(() => {
-          setUploadProgress(prev => (prev < 90 ? prev + 10 : prev));
-        }, 300);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `https://api.telegram.org/bot${creds.token}/sendDocument`);
 
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData
-        });
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 98);
+            setUploadProgress(percent);
+          }
+        };
 
-        clearInterval(progressInterval);
-        setUploadProgress(100);
+        xhr.onload = async () => {
+          try {
+            if (xhr.status === 200) {
+              const data = JSON.parse(xhr.responseText);
+              if (data.ok && data.result) {
+                const result = data.result;
+                let fileId = '';
+                if (result.document?.file_id) fileId = result.document.file_id;
+                else if (result.video?.file_id) fileId = result.video.file_id;
+                else if (result.audio?.file_id) fileId = result.audio.file_id;
+                else if (result.photo && Array.isArray(result.photo) && result.photo.length > 0) {
+                  fileId = result.photo[result.photo.length - 1].file_id;
+                } else if (result.animation?.file_id) fileId = result.animation.file_id;
 
-        const data = await res.json();
-        if (data.success && data.file) {
-          setUploadedResult(data.file);
-          setFileToUpload(null);
-          fetchStats();
-        } else {
-          setUploadError(data.error || 'حدث خطأ أثناء رفع الملف إلى خوادم CloudX');
-        }
-      } else {
-        // Chunked Upload for large files (20MB, 50MB, 100MB, 500MB+)
-        const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+                if (fileId) {
+                  // Record upload in database
+                  const recordRes = await fetch('/api/record-file', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      fileId,
+                      messageId: result.message_id,
+                      chatId: creds.chatId,
+                      originalFilename: file.name,
+                      fileSize: file.size,
+                      mimeType: file.type
+                    })
+                  });
 
-        // 1. Init chunked upload session
-        const initRes = await fetch('/api/upload/init', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filename: fileToUpload.name,
-            fileSize: fileSize,
-            mimeType: fileToUpload.type
-          })
-        });
-        const initData = await initRes.json();
-        if (!initData.success || !initData.uploadId) {
-          throw new Error(initData.error || 'فشل بدء رفع الملف الجزئي');
-        }
+                  const recordData = await recordRes.json();
+                  setUploadProgress(100);
 
-        const uploadId = initData.uploadId;
-
-        // 2. Upload chunks sequentially
-        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-          const start = chunkIndex * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, fileSize);
-          const chunkBlob = fileToUpload.slice(start, end);
-
-          const chunkFormData = new FormData();
-          chunkFormData.append('uploadId', uploadId);
-          chunkFormData.append('chunkIndex', String(chunkIndex));
-          chunkFormData.append('totalChunks', String(totalChunks));
-          chunkFormData.append('chunk', chunkBlob, `${fileToUpload.name}.part${chunkIndex}`);
-
-          const chunkRes = await fetch('/api/upload/chunk', {
-            method: 'POST',
-            body: chunkFormData
-          });
-
-          const chunkData = await chunkRes.json();
-          if (!chunkData.success) {
-            throw new Error(chunkData.error || `فشل رفع الجزء رقم ${chunkIndex + 1}`);
+                  if (recordData.success && recordData.file) {
+                    setUploadedResult(recordData.file);
+                    setFileToUpload(null);
+                    fetchStats();
+                    setIsUploading(false);
+                    return;
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.error('Error handling direct Telegram response:', e);
           }
 
-          const currentPercent = Math.round(((chunkIndex + 1) / totalChunks) * 95);
-          setUploadProgress(currentPercent);
-        }
+          // Fallback if direct response failed
+          await executeServerUpload(file);
+        };
 
-        // 3. Complete and assemble file
-        const completeRes = await fetch('/api/upload/complete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            uploadId,
-            filename: fileToUpload.name,
-            totalChunks,
-            mimeType: fileToUpload.type
-          })
-        });
+        xhr.onerror = async () => {
+          console.warn('Direct upload error, trying fallback route...');
+          await executeServerUpload(file);
+        };
 
-        const completeData = await completeRes.json();
-        setUploadProgress(100);
-
-        if (completeData.success && completeData.file) {
-          setUploadedResult(completeData.file);
-          setFileToUpload(null);
-          fetchStats();
-        } else {
-          setUploadError(completeData.error || 'حدث خطأ أثناء تجميع وتخزين الملف النهائي');
-        }
+        xhr.send(formData);
+      } else {
+        await executeServerUpload(file);
       }
     } catch (err: any) {
       console.error('Upload catch error:', err);
-      setUploadError(err.message || 'فشل الاتصال بالخادم، يرجى المحاولة لاحقاً');
+      setUploadError(err.message || 'حدث خطأ أثناء رفع الملف، يرجى المحاولة لاحقاً');
+      setIsUploading(false);
+    }
+  };
+
+  const executeServerUpload = async (file: File) => {
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      const data = await res.json();
+      setUploadProgress(100);
+
+      if (data.success && data.file) {
+        setUploadedResult(data.file);
+        setFileToUpload(null);
+        fetchStats();
+      } else {
+        setUploadError(data.error || 'حدث خطأ أثناء رفع الملف إلى خوادم CloudX');
+      }
+    } catch (err: any) {
+      setUploadError('فشل الاتصال بالخادم، يرجى المحاولة لاحقاً');
     } finally {
       setIsUploading(false);
     }

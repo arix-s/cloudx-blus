@@ -2,5 +2,7 @@
   "name": "CloudX - منصة التخزين السحابي السريع",
   "description": "خدمة CloudX للتخزين السحابي المباشر السريع لحفظ الملفات ومشاركتها بروابط دائمية فائقة السرعة.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
