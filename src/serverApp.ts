@@ -23,6 +23,15 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.get('/favicon.ico', (req: Request, res: Response) => {
+  const faviconPath = path.resolve(process.cwd(), 'public', 'favicon.svg');
+  if (fs.existsSync(faviconPath)) {
+    res.setHeader('Content-Type', 'image/svg+xml');
+    return res.sendFile(faviconPath);
+  }
+  res.status(204).end();
+});
+
 // Get writable temporary folder for Vercel / local storage
 function getWritableDir(sub: string): string {
   const baseDir = process.env.VERCEL ? path.join('/tmp', sub) : path.resolve(process.cwd(), 'data', sub);
@@ -75,6 +84,7 @@ function getFileExtensionAndName(originalName: string): { extension: string; saf
 // 1. PUBLIC DIRECT FILE SERVING ROUTE (/f/:fileWithExt)
 // ----------------------------------------------------------------------
 app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
+  let fileRecord: StoredFile | null = null;
   try {
     const fileWithExt = req.params.fileWithExt;
     if (!fileWithExt) {
@@ -84,7 +94,7 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
     const lastDotIndex = fileWithExt.lastIndexOf('.');
     const publicId = lastDotIndex !== -1 ? fileWithExt.substring(0, lastDotIndex) : fileWithExt;
 
-    let fileRecord = await getFileById(publicId);
+    fileRecord = await getFileById(publicId);
 
     if (!fileRecord) {
       fileRecord = await getFileById(fileWithExt);
@@ -216,7 +226,48 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Error serving file:', err);
     if (!res.headersSent) {
-      res.status(500).send('حدث خطأ أثناء جلب الملف من خوادم CloudX');
+      // Clean HTML notice for files that exceed Telegram Bot API 20MB limit or need channel access
+      const cleanChatId = fileRecord?.telegram_chat_id ? fileRecord.telegram_chat_id.replace('-100', '') : '';
+      const telegramChannelUrl = (cleanChatId && fileRecord?.telegram_message_id) 
+        ? `https://t.me/c/${cleanChatId}/${fileRecord.telegram_message_id}`
+        : null;
+
+      res.status(200).send(`
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>CloudX - تنبيه تحميل الملف</title>
+          <style>
+            body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 1.5rem; box-sizing: border-box; }
+            .card { background: #1e293b; padding: 2.5rem 2rem; border-radius: 1.25rem; border: 1px solid #334155; max-width: 480px; width: 100%; text-align: center; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.4); }
+            .icon { font-size: 3.5rem; margin-bottom: 1rem; display: block; }
+            h1 { color: #38bdf8; font-size: 1.35rem; margin-bottom: 0.75rem; font-weight: 700; }
+            p { color: #94a3b8; line-height: 1.6; font-size: 0.95rem; margin-bottom: 1.75rem; }
+            .file-info { background: #0f172a; padding: 0.75rem 1rem; border-radius: 0.5rem; font-family: monospace; font-size: 0.85rem; color: #38bdf8; margin-bottom: 1.5rem; word-break: break-all; }
+            .btn-group { display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap; }
+            .btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem; padding: 0.75rem 1.25rem; border-radius: 0.6rem; font-weight: 600; text-decoration: none; font-size: 0.9rem; transition: all 0.2s; }
+            .btn-primary { background: #0284c7; color: white; }
+            .btn-primary:hover { background: #0369a1; }
+            .btn-secondary { background: #334155; color: #f8fafc; }
+            .btn-secondary:hover { background: #475569; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <span class="icon">🎬</span>
+            <h1>الملف محفوظ وفي انتظار التحميل</h1>
+            <div class="file-info">${fileRecord?.original_filename || 'الملف المطلوب'}</div>
+            <p>يتجاوز حجم هذا الملف حد التحميل المباشر الآلي (20MB) عبر المساعد. يمكنك تنزيل أو مشاهدة الفيديو مباشرة عبر قناتك على تلجرام.</p>
+            <div class="btn-group">
+              ${telegramChannelUrl ? `<a href="${telegramChannelUrl}" target="_blank" class="btn btn-primary">📱 فتح الملف في تلجرام</a>` : ''}
+              <a href="/" class="btn btn-secondary">العودة للرئيسية</a>
+            </div>
+          </div>
+        </body>
+        </html>
+      `);
     }
   }
 });
