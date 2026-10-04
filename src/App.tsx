@@ -221,10 +221,10 @@ export default function App() {
 
     const file = fileToUpload;
 
-    // Use Cloudflare Worker endpoint if provided in environment, or local worker proxy
+    // Use Cloudflare Worker endpoint if provided in environment, or live worker URL
     const workerEndpoint =
       import.meta.env.VITE_CF_WORKER_URL ||
-      '/api/worker-upload';
+      'https://cloudx-blus.mhmdbasht588.workers.dev';
 
     try {
       const formData = new FormData();
