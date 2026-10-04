@@ -286,99 +286,77 @@ app.post('/api/record-file', async (req: Request, res: Response) => {
   }
 });
 
-// Chunked Upload: 1. Initialize
-app.post('/api/upload/init', (req: Request, res: Response) => {
-  try {
-    const { filename, fileSize, mimeType } = req.body;
-    if (!filename) {
-      return res.status(400).json({ success: false, error: 'اسم الملف مطلوب' });
-    }
-    const uploadId = generatePublicId() + '_' + Date.now();
-    const chunkDir = getWritableDir(path.join('chunks', uploadId));
-
-    return res.json({
-      success: true,
-      uploadId
-    });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: 'فشل بدء تهيئة الرفع الجزئي' });
-  }
-});
-
-// Chunked Upload: 2. Upload Chunk (Memory / Disk buffer for 2MB chunks)
+// Chunked Upload: 1. Upload 2MB Chunk directly to Stateless Storage (Telegram)
 const chunkStorage = multer.memoryStorage();
 const uploadChunk = multer({ storage: chunkStorage });
 
 app.post('/api/upload/chunk', uploadChunk.single('chunk'), async (req: Request, res: Response) => {
   try {
-    const { uploadId, chunkIndex } = req.body;
-    if (!uploadId || chunkIndex === undefined || !req.file) {
+    const rawChunkIndex = req.body?.chunkIndex !== undefined ? req.body.chunkIndex : req.headers['x-chunk-index'];
+    if (!req.file || rawChunkIndex === undefined || rawChunkIndex === null) {
       return res.status(400).json({ success: false, error: 'بيانات الجزء المرفوع غير مكتملة' });
     }
+    const chunkIndex = Number(rawChunkIndex);
 
-    const chunkDir = getWritableDir(path.join('chunks', uploadId));
-    const chunkFilePath = path.join(chunkDir, `chunk_${chunkIndex}`);
-
-    fs.writeFileSync(chunkFilePath, req.file.buffer);
+    const { safeName } = getFileExtensionAndName(req.file.originalname || 'part.bin');
+    const tgResult = await uploadFileToTelegram(
+      req.file.buffer,
+      `part_${chunkIndex}_${safeName}`,
+      req.file.mimetype || 'application/octet-stream'
+    );
 
     return res.json({
       success: true,
-      uploadId,
-      chunkIndex: Number(chunkIndex)
+      chunkIndex: Number(chunkIndex),
+      fileId: tgResult.fileId
     });
   } catch (err: any) {
-    console.error('Error saving chunk:', err);
-    return res.status(500).json({ success: false, error: 'فشل حفظ جزء الملف' });
+    console.error('Error uploading chunk:', err);
+    return res.status(500).json({ success: false, error: 'فشل حفظ جزء الملف: ' + (err.message || String(err)) });
   }
 });
 
-// Chunked Upload: 3. Complete & Reassemble
+// Chunked Upload: 2. Complete & Reassemble Stateless Chunks
 app.post('/api/upload/complete', async (req: Request, res: Response) => {
   try {
-    const { uploadId, filename, totalChunks, mimeType } = req.body;
-    if (!uploadId || !filename || !totalChunks) {
+    const { chunkFileIds, filename, mimeType, fileSize } = req.body;
+    if (!filename || !Array.isArray(chunkFileIds) || chunkFileIds.length === 0) {
       return res.status(400).json({ success: false, error: 'بيانات التجميع غير مكتملة' });
     }
 
-    const chunkDir = getWritableDir(path.join('chunks', uploadId));
     const publicId = generatePublicId();
     const { extension, safeName } = getFileExtensionAndName(filename);
 
-    const assembledPath = path.join(tmpUploadsDir, `${publicId}_assembled${extension}`);
-    if (fs.existsSync(assembledPath)) {
-      try { fs.unlinkSync(assembledPath); } catch (e) {}
-    }
+    const chunkBuffers: Buffer[] = [];
+    let totalSize = 0;
 
-    let totalSizeBytes = 0;
-
-    for (let i = 0; i < Number(totalChunks); i++) {
-      const chunkFilePath = path.join(chunkDir, `chunk_${i}`);
-      if (!fs.existsSync(chunkFilePath)) {
-        return res.status(400).json({ success: false, error: `الجزء رقم ${i} غير موجود` });
+    for (let i = 0; i < chunkFileIds.length; i++) {
+      const chunkFileId = chunkFileIds[i];
+      const chunkUrl = await getTelegramFileUrl(chunkFileId);
+      const chunkRes = await fetch(chunkUrl);
+      if (!chunkRes.ok) {
+        throw new Error(`فشل جلب الجزء رقم ${i + 1} للتجميع`);
       }
-      const chunkBuffer = fs.readFileSync(chunkFilePath);
-      totalSizeBytes += chunkBuffer.length;
-      fs.appendFileSync(assembledPath, chunkBuffer);
+      const chunkArrayBuf = await chunkRes.arrayBuffer();
+      const chunkBuf = Buffer.from(chunkArrayBuf);
+      totalSize += chunkBuf.length;
+      chunkBuffers.push(chunkBuf);
     }
 
-    // Clean up chunks folder
-    try {
-      fs.rmSync(chunkDir, { recursive: true, force: true });
-    } catch (e) {}
+    const assembledBuffer = Buffer.concat(chunkBuffers);
 
     let telegramResult: { chatId: string; messageId: number; fileId: string } | null = null;
     const maxTelegramBytes = 50 * 1024 * 1024;
 
-    if (totalSizeBytes <= maxTelegramBytes) {
+    if (assembledBuffer.length <= maxTelegramBytes) {
       try {
-        const assembledBuffer = fs.readFileSync(assembledPath);
         telegramResult = await uploadFileToTelegram(
           assembledBuffer,
           safeName,
           mimeType || 'application/octet-stream'
         );
       } catch (tgErr: any) {
-        console.warn('Telegram channel fallback on complete:', tgErr.message);
+        console.warn('Telegram channel reassemble fallback:', tgErr.message);
       }
     }
 
@@ -387,18 +365,13 @@ app.post('/api/upload/complete', async (req: Request, res: Response) => {
       const localFileName = `${publicId}${extension}`;
       const destPath = path.resolve(persistentUploadsDir, localFileName);
 
-      fs.copyFileSync(assembledPath, destPath);
+      fs.writeFileSync(destPath, assembledBuffer);
 
       telegramResult = {
         chatId: 'cloudx_local',
         messageId: 0,
         fileId: `local:${localFileName}`
       };
-    }
-
-    // Clean up assembled temp file
-    if (fs.existsSync(assembledPath)) {
-      try { fs.unlinkSync(assembledPath); } catch (e) {}
     }
 
     const createdIso = new Date().toISOString();
@@ -408,7 +381,7 @@ app.post('/api/upload/complete', async (req: Request, res: Response) => {
       original_filename: filename,
       file_extension: extension,
       mime_type: mimeType || 'application/octet-stream',
-      file_size: totalSizeBytes,
+      file_size: Number(fileSize) || totalSize,
       telegram_chat_id: telegramResult.chatId,
       telegram_message_id: telegramResult.messageId,
       telegram_file_id: telegramResult.fileId,
@@ -436,7 +409,7 @@ app.post('/api/upload/complete', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error('Error completing chunked upload:', err);
-    return res.status(500).json({ success: false, error: 'حدث خطأ أثناء تجميع وتخزين الملف: ' + (err.message || String(err)) });
+    return res.status(500).json({ success: false, error: 'حدث خطأ أثناء تجميع وتخزين الملف النهائي: ' + (err.message || String(err)) });
   }
 });
 
