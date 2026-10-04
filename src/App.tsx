@@ -220,80 +220,140 @@ export default function App() {
     setUploadError(null);
 
     const file = fileToUpload;
-
-    // Use Cloudflare Worker endpoint if provided in environment, or live worker URL
     const workerEndpoint =
       import.meta.env.VITE_CF_WORKER_URL ||
       'https://cloudx-blus.mhmdbasht588.workers.dev';
 
+    const CHUNK_SIZE = 15 * 1024 * 1024; // 15MB chunks to ensure every Telegram chunk is < 20MB limit
+
     try {
-      const formData = new FormData();
-      formData.append('file', file, file.name);
+      if (file.size <= CHUNK_SIZE) {
+        // Single File Upload
+        const formData = new FormData();
+        formData.append('file', file, file.name);
 
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', workerEndpoint);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', workerEndpoint);
 
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const percent = Math.round((e.loaded / e.total) * 95);
-          setUploadProgress(percent);
-        }
-      };
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 95);
+            setUploadProgress(percent);
+          }
+        };
 
-      xhr.onload = async () => {
-        try {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            const data = JSON.parse(xhr.responseText);
-            if (data.success && data.fileId) {
-              // Record upload in database to obtain permanent direct short URL (/f/:id)
-              const recordRes = await fetch('/api/record-file', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  fileId: data.fileId,
-                  messageId: data.messageId,
-                  chatId: data.chatId,
-                  originalFilename: data.originalFilename || file.name,
-                  fileSize: data.fileSize || file.size,
-                  mimeType: data.mimeType || file.type
-                })
-              });
+        xhr.onload = async () => {
+          try {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              const data = JSON.parse(xhr.responseText);
+              if (data.success && data.fileId) {
+                const recordRes = await fetch('/api/record-file', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    fileId: data.fileId,
+                    messageId: data.messageId,
+                    chatId: data.chatId,
+                    originalFilename: data.originalFilename || file.name,
+                    fileSize: data.fileSize || file.size,
+                    mimeType: data.mimeType || file.type
+                  })
+                });
 
-              const recordData = await recordRes.json();
-              setUploadProgress(100);
+                const recordData = await recordRes.json();
+                setUploadProgress(100);
 
-              if (recordData.success && recordData.file) {
-                setUploadedResult(recordData.file);
-                setFileToUpload(null);
-                fetchStats();
+                if (recordData.success && recordData.file) {
+                  setUploadedResult(recordData.file);
+                  setFileToUpload(null);
+                  fetchStats();
+                } else {
+                  setUploadError(recordData.error || 'حدث خطأ أثناء حفظ بيانات الملف المرفوع');
+                }
               } else {
-                setUploadError(recordData.error || 'حدث خطأ أثناء حفظ بيانات الملف المرفوع');
+                setUploadError(data.error || 'حدث خطأ أثناء الرفع عبر خادم Cloudflare Worker');
               }
             } else {
-              setUploadError(data.error || 'حدث خطأ أثناء الرفع عبر خادم Cloudflare Worker');
+              let errMsg = 'فشل الرفع إلى خادم Cloudflare Worker';
+              try {
+                const errObj = JSON.parse(xhr.responseText);
+                if (errObj.error) errMsg = errObj.error;
+              } catch (e) {}
+              setUploadError(errMsg);
             }
-          } else {
-            let errMsg = 'فشل الرفع إلى خادم Cloudflare Worker';
-            try {
-              const errObj = JSON.parse(xhr.responseText);
-              if (errObj.error) errMsg = errObj.error;
-            } catch (e) {}
-            setUploadError(errMsg);
+          } catch (e) {
+            console.error('Error handling worker upload response:', e);
+            setUploadError('حدث خطأ أثناء معالجة استجابة الخادم');
+          } finally {
+            setIsUploading(false);
           }
-        } catch (e) {
-          console.error('Error handling worker upload response:', e);
-          setUploadError('حدث خطأ أثناء معالجة استجابة الخادم');
-        } finally {
+        };
+
+        xhr.onerror = () => {
+          setUploadError('فشل الاتصال بخادم Cloudflare Worker، يرجى التحقق من الشبكة والمحاولة لاحقاً');
           setIsUploading(false);
+        };
+
+        xhr.send(formData);
+      } else {
+        // Multi-chunk upload for large files (> 15MB)
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const chunkFileIds: string[] = [];
+        let lastChatId = '-1003839994672';
+        let lastMessageId = 0;
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(file.size, start + CHUNK_SIZE);
+          const chunkBlob = file.slice(start, end);
+
+          const formData = new FormData();
+          formData.append('file', chunkBlob, `part_${i + 1}_${file.name}`);
+
+          const res = await fetch(workerEndpoint, {
+            method: 'POST',
+            body: formData
+          });
+
+          const data = await res.json();
+          if (!data.success || !data.fileId) {
+            throw new Error(data.error || `فشل رفع الجزء رقم ${i + 1}`);
+          }
+
+          chunkFileIds.push(data.fileId);
+          if (data.chatId) lastChatId = data.chatId;
+          if (data.messageId) lastMessageId = data.messageId;
+
+          const progressPercent = Math.round(((i + 1) / totalChunks) * 95);
+          setUploadProgress(progressPercent);
         }
-      };
 
-      xhr.onerror = () => {
-        setUploadError('فشل الاتصال بخادم Cloudflare Worker، يرجى التحقق من الشبكة والمحاولة لاحقاً');
+        // Complete chunked upload
+        const completeRes = await fetch('/api/upload/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chunkFileIds,
+            filename: file.name,
+            mimeType: file.type,
+            fileSize: file.size,
+            chatId: lastChatId,
+            messageId: lastMessageId
+          })
+        });
+
+        const completeData = await completeRes.json();
+        setUploadProgress(100);
+
+        if (completeData.success && completeData.file) {
+          setUploadedResult(completeData.file);
+          setFileToUpload(null);
+          fetchStats();
+        } else {
+          setUploadError(completeData.error || 'حدث خطأ أثناء حظر أجزاء الملف المرفوع');
+        }
         setIsUploading(false);
-      };
-
-      xhr.send(formData);
+      }
     } catch (err: any) {
       console.error('Upload catch error:', err);
       setUploadError(err.message || 'فشل الاتصال بالخادم، يرجى المحاولة لاحقاً');
