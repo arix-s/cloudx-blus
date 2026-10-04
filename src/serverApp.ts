@@ -225,14 +225,37 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
 // 2. API ENDPOINTS
 // ----------------------------------------------------------------------
 
-// Get direct upload credentials
-app.get('/api/upload-credentials', (req: Request, res: Response) => {
-  const creds = getTelegramCredentials();
-  return res.json({
-    success: true,
-    token: creds.token,
-    chatId: creds.chatId
-  });
+const chunkStorage = multer.memoryStorage();
+const uploadChunk = multer({ storage: chunkStorage });
+
+// Local Cloudflare Worker simulation/proxy endpoint
+app.post('/api/worker-upload', uploadChunk.single('file'), async (req: Request, res: Response) => {
+  try {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ success: false, error: 'لم يتم العثور على أي ملف للرفع' });
+    }
+
+    const { safeName } = getFileExtensionAndName(file.originalname || 'document.bin');
+    const tgResult = await uploadFileToTelegram(
+      file.buffer,
+      safeName,
+      file.mimetype || 'application/octet-stream'
+    );
+
+    return res.json({
+      success: true,
+      fileId: tgResult.fileId,
+      messageId: tgResult.messageId,
+      chatId: tgResult.chatId,
+      originalFilename: file.originalname,
+      fileSize: file.size,
+      mimeType: file.mimetype
+    });
+  } catch (err: any) {
+    console.error('Error in worker upload endpoint:', err);
+    return res.status(500).json({ success: false, error: 'حدث خطأ في الخادم أثناء رفع الملف: ' + (err.message || String(err)) });
+  }
 });
 
 // Record completed direct client upload
@@ -287,9 +310,6 @@ app.post('/api/record-file', async (req: Request, res: Response) => {
 });
 
 // Chunked Upload: 1. Upload 2MB Chunk directly to Stateless Storage (Telegram)
-const chunkStorage = multer.memoryStorage();
-const uploadChunk = multer({ storage: chunkStorage });
-
 app.post('/api/upload/chunk', uploadChunk.single('chunk'), async (req: Request, res: Response) => {
   try {
     const rawChunkIndex = req.body?.chunkIndex !== undefined ? req.body.chunkIndex : req.headers['x-chunk-index'];

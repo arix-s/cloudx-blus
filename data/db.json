@@ -1,5 +1,16 @@
 [
   {
+    "id": "je7fuo",
+    "original_filename": "cf_worker_test.txt",
+    "file_extension": ".txt",
+    "mime_type": "text/plain",
+    "file_size": 37,
+    "telegram_chat_id": "-1003839994672",
+    "telegram_message_id": 339,
+    "telegram_file_id": "BQACAgIAAyEGAATk4aswAAIBU2rBwSvJTFRBx4XPfOMkGL4QFX7jAALSqwACXGsISluJn6s8gwWfPQQ",
+    "created_at": "2026-10-04T02:59:55.153Z"
+  },
+  {
     "id": "g2qq61",
     "original_filename": "mp4.5334708324933872235.mp4",
     "file_extension": ".mp4",

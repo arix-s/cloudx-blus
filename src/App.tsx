@@ -220,95 +220,83 @@ export default function App() {
     setUploadError(null);
 
     const file = fileToUpload;
-    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB chunks (always < 4.5MB Vercel serverless limit)
-    const fileSize = file.size;
+
+    // Use Cloudflare Worker endpoint if provided in environment, or local worker proxy
+    const workerEndpoint =
+      import.meta.env.VITE_CF_WORKER_URL ||
+      '/api/worker-upload';
 
     try {
-      if (fileSize <= 3 * 1024 * 1024) {
-        // Direct single upload for small files
-        const formData = new FormData();
-        formData.append('file', file);
+      const formData = new FormData();
+      formData.append('file', file, file.name);
 
-        const progressInterval = setInterval(() => {
-          setUploadProgress(prev => (prev < 90 ? prev + 10 : prev));
-        }, 300);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', workerEndpoint);
 
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData
-        });
-
-        clearInterval(progressInterval);
-        setUploadProgress(100);
-
-        const data = await res.json();
-        if (data.success && data.file) {
-          setUploadedResult(data.file);
-          setFileToUpload(null);
-          fetchStats();
-        } else {
-          setUploadError(data.error || 'حدث خطأ أثناء رفع الملف إلى خوادم CloudX');
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 95);
+          setUploadProgress(percent);
         }
-      } else {
-        // Stateless Chunked Upload for large files (20MB, 50MB, 100MB, 500MB+)
-        const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-        const chunkFileIds: string[] = [];
+      };
 
-        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-          const start = chunkIndex * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, fileSize);
-          const chunkBlob = file.slice(start, end);
+      xhr.onload = async () => {
+        try {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const data = JSON.parse(xhr.responseText);
+            if (data.success && data.fileId) {
+              // Record upload in database to obtain permanent direct short URL (/f/:id)
+              const recordRes = await fetch('/api/record-file', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  fileId: data.fileId,
+                  messageId: data.messageId,
+                  chatId: data.chatId,
+                  originalFilename: data.originalFilename || file.name,
+                  fileSize: data.fileSize || file.size,
+                  mimeType: data.mimeType || file.type
+                })
+              });
 
-          const chunkFormData = new FormData();
-          chunkFormData.append('chunkIndex', String(chunkIndex));
-          chunkFormData.append('totalChunks', String(totalChunks));
-          chunkFormData.append('chunk', chunkBlob, `${file.name}.part${chunkIndex}`);
+              const recordData = await recordRes.json();
+              setUploadProgress(100);
 
-          const chunkRes = await fetch('/api/upload/chunk', {
-            method: 'POST',
-            headers: { 'x-chunk-index': String(chunkIndex) },
-            body: chunkFormData
-          });
-
-          const chunkData = await chunkRes.json();
-          if (!chunkData.success || !chunkData.fileId) {
-            throw new Error(chunkData.error || `فشل رفع الجزء رقم ${chunkIndex + 1}`);
+              if (recordData.success && recordData.file) {
+                setUploadedResult(recordData.file);
+                setFileToUpload(null);
+                fetchStats();
+              } else {
+                setUploadError(recordData.error || 'حدث خطأ أثناء حفظ بيانات الملف المرفوع');
+              }
+            } else {
+              setUploadError(data.error || 'حدث خطأ أثناء الرفع عبر خادم Cloudflare Worker');
+            }
+          } else {
+            let errMsg = 'فشل الرفع إلى خادم Cloudflare Worker';
+            try {
+              const errObj = JSON.parse(xhr.responseText);
+              if (errObj.error) errMsg = errObj.error;
+            } catch (e) {}
+            setUploadError(errMsg);
           }
-
-          chunkFileIds.push(chunkData.fileId);
-
-          const currentPercent = Math.round(((chunkIndex + 1) / totalChunks) * 85);
-          setUploadProgress(currentPercent);
+        } catch (e) {
+          console.error('Error handling worker upload response:', e);
+          setUploadError('حدث خطأ أثناء معالجة استجابة الخادم');
+        } finally {
+          setIsUploading(false);
         }
+      };
 
-        // Complete and assemble file
-        setUploadProgress(90);
-        const completeRes = await fetch('/api/upload/complete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chunkFileIds,
-            filename: file.name,
-            fileSize: file.size,
-            mimeType: file.type
-          })
-        });
+      xhr.onerror = () => {
+        setUploadError('فشل الاتصال بخادم Cloudflare Worker، يرجى التحقق من الشبكة والمحاولة لاحقاً');
+        setIsUploading(false);
+      };
 
-        const completeData = await completeRes.json();
-        setUploadProgress(100);
-
-        if (completeData.success && completeData.file) {
-          setUploadedResult(completeData.file);
-          setFileToUpload(null);
-          fetchStats();
-        } else {
-          setUploadError(completeData.error || 'حدث خطأ أثناء تجميع وتخزين الملف النهائي');
-        }
-      }
+      xhr.send(formData);
     } catch (err: any) {
       console.error('Upload catch error:', err);
       setUploadError(err.message || 'فشل الاتصال بالخادم، يرجى المحاولة لاحقاً');
-    } finally {
       setIsUploading(false);
     }
   };
