@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import pg from 'pg';
+import { decodeFileToken, getMimeTypeFromExt } from '../utils/token.js';
 
 export interface StoredFile {
   id: string; // public random id (e.g., 'a82k3')
@@ -156,7 +157,33 @@ export async function getFileById(id: string): Promise<StoredFile | null> {
   }
 
   const files = ensureLocalDbFile();
-  return files.find(f => f.id === cleanId) || null;
+  const localMatch = files.find(f => f.id === cleanId);
+  if (localMatch) {
+    return localMatch;
+  }
+
+  // Fallback: Decode stateless file token (for serverless persistence across restarts)
+  try {
+    const decoded = decodeFileToken(cleanId);
+    if (decoded && decoded.tf) {
+      const ext = path.extname(decoded.fn || '').toLowerCase() || '.bin';
+      return {
+        id: cleanId,
+        original_filename: decoded.fn || 'file' + ext,
+        file_extension: ext,
+        mime_type: decoded.mt || getMimeTypeFromExt(ext),
+        file_size: Number(decoded.sz) || 0,
+        telegram_chat_id: decoded.ch || '-1003839994672',
+        telegram_message_id: Number(decoded.ms) || 0,
+        telegram_file_id: decoded.tf,
+        created_at: new Date().toISOString()
+      };
+    }
+  } catch (err) {
+    // Ignore decode error
+  }
+
+  return null;
 }
 
 export async function getAllFiles(searchQuery?: string): Promise<StoredFile[]> {

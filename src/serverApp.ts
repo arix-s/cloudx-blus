@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 dotenv.config();
 
 import { initDb, saveFileRecord, getFileById, getAllFiles, deleteFileRecord, StoredFile } from './db/index.js';
+import { encodeFileToken } from './utils/token.js';
 import {
   uploadFileToTelegram,
   getTelegramFileUrl,
@@ -363,7 +364,18 @@ app.post('/api/record-file', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'بيانات التسجيل غير مكتملة' });
     }
 
-    const publicId = generatePublicId();
+    const hasDb = process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '';
+    const publicId = hasDb
+      ? generatePublicId()
+      : encodeFileToken({
+          tf: fileId,
+          fn: originalFilename,
+          sz: Number(fileSize) || 0,
+          ch: chatId || '-1003839994672',
+          ms: Number(messageId) || 0,
+          mt: mimeType || 'application/octet-stream'
+        }) || generatePublicId();
+
     const { extension } = getFileExtensionAndName(originalFilename);
 
     const createdIso = new Date().toISOString();
@@ -440,12 +452,23 @@ app.post('/api/upload/complete', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'بيانات التجميع غير مكتملة' });
     }
 
-    const publicId = generatePublicId();
-    const { extension } = getFileExtensionAndName(filename);
-
     const telegramFileId = chunkFileIds.length === 1
       ? chunkFileIds[0]
       : `chunks:${chunkFileIds.join(',')}`;
+
+    const hasDb = process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '';
+    const publicId = hasDb
+      ? generatePublicId()
+      : encodeFileToken({
+          tf: telegramFileId,
+          fn: filename,
+          sz: Number(fileSize) || 0,
+          ch: chatId || '-1003839994672',
+          ms: Number(messageId) || 0,
+          mt: mimeType || 'application/octet-stream'
+        }) || generatePublicId();
+
+    const { extension } = getFileExtensionAndName(filename);
 
     const createdIso = new Date().toISOString();
 
