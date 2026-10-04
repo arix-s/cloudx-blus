@@ -239,3 +239,81 @@ export async function deleteTelegramMessage(chatId: string, messageId: number): 
     return false;
   }
 }
+
+/**
+ * Retrieves file metadata and fileId directly from a Telegram Message ID
+ */
+export async function getTelegramFileByMessageId(messageId: number): Promise<{
+  fileId: string;
+  filename: string;
+  fileSize: number;
+  mimeType: string;
+  chatId: string;
+} | null> {
+  const { token, chatId } = getTelegramCredentials();
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/forwardMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        from_chat_id: chatId,
+        message_id: messageId,
+        disable_notification: true
+      })
+    });
+
+    const data = await res.json();
+    if (!data.ok || !data.result) return null;
+
+    const msg = data.result;
+    const tempMessageId = msg.message_id;
+
+    let fileId = '';
+    let filename = 'file';
+    let fileSize = 0;
+    let mimeType = 'application/octet-stream';
+
+    if (msg.document) {
+      fileId = msg.document.file_id;
+      filename = msg.document.file_name || 'document';
+      fileSize = msg.document.file_size || 0;
+      mimeType = msg.document.mime_type || 'application/octet-stream';
+    } else if (msg.video) {
+      fileId = msg.video.file_id;
+      filename = msg.video.file_name || 'video.mp4';
+      fileSize = msg.video.file_size || 0;
+      mimeType = msg.video.mime_type || 'video/mp4';
+    } else if (msg.audio) {
+      fileId = msg.audio.file_id;
+      filename = msg.audio.file_name || 'audio.mp3';
+      fileSize = msg.audio.file_size || 0;
+      mimeType = msg.audio.mime_type || 'audio/mpeg';
+    } else if (msg.photo && Array.isArray(msg.photo) && msg.photo.length > 0) {
+      const photo = msg.photo[msg.photo.length - 1];
+      fileId = photo.file_id;
+      filename = 'image.jpg';
+      fileSize = photo.file_size || 0;
+      mimeType = 'image/jpeg';
+    } else if (msg.animation) {
+      fileId = msg.animation.file_id;
+      filename = msg.animation.file_name || 'animation.gif';
+      fileSize = msg.animation.file_size || 0;
+      mimeType = msg.animation.mime_type || 'image/gif';
+    }
+
+    // Asynchronously delete temporary forwarded message
+    fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: tempMessageId })
+    }).catch(() => {});
+
+    if (!fileId) return null;
+
+    return { fileId, filename, fileSize, mimeType, chatId };
+  } catch (err) {
+    console.error('Error fetching file by message ID:', err);
+    return null;
+  }
+}

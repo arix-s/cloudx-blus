@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import pg from 'pg';
 import { decodeFileToken, getMimeTypeFromExt } from '../utils/token.js';
+import { shortCodeToMessageId } from '../utils/shortCode.js';
+import { getTelegramFileByMessageId } from '../services/telegram.js';
 
 export interface StoredFile {
   id: string; // public random id (e.g., 'a82k3')
@@ -162,7 +164,34 @@ export async function getFileById(id: string): Promise<StoredFile | null> {
     return localMatch;
   }
 
-  // Fallback: Decode stateless file token (for serverless persistence across restarts)
+  // Fallback 1: Decode 6-character short code to Telegram messageId
+  try {
+    const msgId = shortCodeToMessageId(cleanId);
+    if (msgId) {
+      const tgFile = await getTelegramFileByMessageId(msgId);
+      if (tgFile) {
+        const ext = path.extname(tgFile.filename).toLowerCase() || '.bin';
+        const record: StoredFile = {
+          id: cleanId,
+          original_filename: tgFile.filename,
+          file_extension: ext,
+          mime_type: tgFile.mimeType || getMimeTypeFromExt(ext),
+          file_size: tgFile.fileSize || 0,
+          telegram_chat_id: tgFile.chatId,
+          telegram_message_id: msgId,
+          telegram_file_id: tgFile.fileId,
+          created_at: new Date().toISOString()
+        };
+        // Cache record locally
+        saveFileRecord(record).catch(() => {});
+        return record;
+      }
+    }
+  } catch (err) {
+    console.warn('Error resolving short code to Telegram message:', err);
+  }
+
+  // Fallback 2: Decode stateless file token
   try {
     const decoded = decodeFileToken(cleanId);
     if (decoded && decoded.tf) {

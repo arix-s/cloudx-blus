@@ -10,6 +10,7 @@ dotenv.config();
 
 import { initDb, saveFileRecord, getFileById, getAllFiles, deleteFileRecord, StoredFile } from './db/index.js';
 import { encodeFileToken } from './utils/token.js';
+import { messageIdToShortCode } from './utils/shortCode.js';
 import {
   uploadFileToTelegram,
   getTelegramFileUrl,
@@ -81,6 +82,102 @@ function getFileExtensionAndName(originalName: string): { extension: string; saf
   };
 }
 
+function renderOpenGraphPreviewHtml(fileRecord: StoredFile, fileWithExt: string, reqHost: string, protocol: string): string {
+  const fullRawUrl = `${protocol}://${reqHost}/f/${fileWithExt}?raw=1`;
+  const fullDownloadUrl = `${protocol}://${reqHost}/f/${fileWithExt}?download=1`;
+  const isImage = fileRecord.mime_type.startsWith('image/') || ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(fileRecord.file_extension.toLowerCase());
+  const isVideo = fileRecord.mime_type.startsWith('video/') || ['.mp4', '.webm', '.mkv', '.mov', '.avi'].includes(fileRecord.file_extension.toLowerCase());
+  const isAudio = fileRecord.mime_type.startsWith('audio/') || ['.mp3', '.wav', '.ogg', '.m4a', '.flac'].includes(fileRecord.file_extension.toLowerCase());
+
+  let formattedSize = 'غير معروف';
+  if (fileRecord.file_size > 0) {
+    if (fileRecord.file_size < 1024 * 1024) {
+      formattedSize = (fileRecord.file_size / 1024).toFixed(1) + ' KB';
+    } else {
+      formattedSize = (fileRecord.file_size / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+  }
+
+  const title = fileRecord.original_filename || 'ملف CloudX';
+  const description = `حجم الملف: ${formattedSize} | استضافة وتخزين سحابي مباشر سريع عبر منصة CloudX`;
+
+  return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title} - CloudX</title>
+  
+  <!-- OpenGraph Meta Tags for Social Media (WhatsApp, Telegram, Facebook, Twitter, Discord) -->
+  <meta property="og:site_name" content="CloudX Storage" />
+  <meta property="og:title" content="${title}" />
+  <meta property="og:description" content="${description}" />
+  <meta property="og:url" content="${protocol}://${reqHost}/f/${fileWithExt}" />
+  ${isImage ? `<meta property="og:type" content="image" /><meta property="og:image" content="${fullRawUrl}" /><meta property="og:image:type" content="${fileRecord.mime_type}" />` : ''}
+  ${isVideo ? `<meta property="og:type" content="video.other" /><meta property="og:video" content="${fullRawUrl}" /><meta property="og:video:secure_url" content="${fullRawUrl}" /><meta property="og:video:type" content="video/mp4" /><meta property="og:image" content="${fullRawUrl}" />` : ''}
+  ${isAudio ? `<meta property="og:type" content="music.song" /><meta property="og:audio" content="${fullRawUrl}" /><meta property="og:audio:type" content="audio/mpeg" />` : ''}
+  
+  <meta name="twitter:card" content="${isVideo || isImage ? 'summary_large_image' : 'summary'}" />
+  <meta name="twitter:title" content="${title}" />
+  <meta name="twitter:description" content="${description}" />
+  ${isImage || isVideo ? `<meta name="twitter:image" content="${fullRawUrl}" />` : ''}
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Cairo', system-ui, sans-serif; background-color: #030712; color: #f3f4f6; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between p-4 md:p-8">
+  <header class="max-w-4xl mx-auto w-full flex items-center justify-between pb-6 border-b border-gray-800">
+    <a href="/" class="flex items-center gap-2 text-xl font-extrabold text-cyan-400">
+      <svg class="w-7 h-7 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.5 19B5.5 5.5 0 0 0 18 8h-1.26A8 8 0 1 0 3 16.3"></path></svg>
+      <span>Cloud<span class="text-white">X</span></span>
+    </a>
+    <span class="text-xs bg-cyan-950 text-cyan-400 border border-cyan-800/50 px-3 py-1 rounded-full font-mono">
+      ${formattedSize}
+    </span>
+  </header>
+
+  <main class="max-w-4xl mx-auto w-full my-auto py-8">
+    <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 md:p-8 shadow-2xl backdrop-blur-md">
+      <div class="mb-6 text-center">
+        <h1 class="text-xl md:text-2xl font-bold text-slate-100 break-all mb-2" dir="ltr">${fileRecord.original_filename}</h1>
+        <p class="text-sm text-slate-400">ملف جاهز للعرض والتحميل المباشر الفائق السرعة</p>
+      </div>
+
+      <!-- Player / Media Content -->
+      <div class="my-6 flex justify-center items-center bg-slate-950/60 rounded-xl p-4 border border-slate-800/80 min-h-[220px]">
+        ${isImage ? `<img src="${fullRawUrl}" alt="${title}" class="max-h-[65vh] rounded-lg object-contain shadow-lg" />` : ''}
+        ${isVideo ? `<video controls autoplay class="w-full max-h-[65vh] rounded-lg shadow-lg" src="${fullRawUrl}"></video>` : ''}
+        ${isAudio ? `<div class="w-full p-4 text-center"><div class="text-4xl mb-4">🎵</div><audio controls class="w-full" src="${fullRawUrl}"></audio></div>` : ''}
+        ${!isImage && !isVideo && !isAudio ? `<div class="text-center p-8"><div class="text-5xl mb-3">📁</div><p class="text-slate-300 font-medium">${fileRecord.original_filename}</p><p class="text-xs text-slate-500 mt-1">${fileRecord.mime_type}</p></div>` : ''}
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="flex flex-col sm:flex-row gap-3 justify-center mt-8">
+        <a href="${fullDownloadUrl}" class="flex items-center justify-center gap-2 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-bold px-6 py-3.5 rounded-xl shadow-lg transition-all transform hover:-translate-y-0.5">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+          <span>تحميل مباشر سريع</span>
+        </a>
+        <a href="${fullRawUrl}" target="_blank" class="flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold px-5 py-3.5 rounded-xl border border-slate-700 transition-all">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+          <span>فتح الرابط المباشر (Raw)</span>
+        </a>
+        <a href="/" class="flex items-center justify-center gap-2 bg-slate-900 hover:bg-slate-800 text-slate-400 font-medium px-4 py-3.5 rounded-xl border border-slate-800 transition-all">
+          <span>الرئيسية</span>
+        </a>
+      </div>
+    </div>
+  </main>
+
+  <footer class="text-center text-xs text-slate-600 py-4">
+    CloudX Storage Platform &copy; 2026 - جميع الحقوق محفوظة
+  </footer>
+</body>
+</html>`;
+}
+
 // ----------------------------------------------------------------------
 // 1. PUBLIC DIRECT FILE SERVING ROUTE (/f/:fileWithExt)
 // ----------------------------------------------------------------------
@@ -125,6 +222,24 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
         </body>
         </html>
       `);
+    }
+
+    const isRawOrMediaReq =
+      req.query.raw === '1' ||
+      req.query.download === '1' ||
+      Boolean(req.headers.range) ||
+      req.headers['sec-fetch-dest'] === 'video' ||
+      req.headers['sec-fetch-dest'] === 'audio' ||
+      req.headers['sec-fetch-dest'] === 'image' ||
+      req.headers.accept?.includes('image/') ||
+      req.headers.accept?.includes('video/') ||
+      req.headers.accept?.includes('audio/');
+
+    const reqHost = req.get('host') || 'localhost:3000';
+    const protocol = req.protocol || 'http';
+
+    if (!isRawOrMediaReq) {
+      return res.status(200).send(renderOpenGraphPreviewHtml(fileRecord, fileWithExt, reqHost, protocol));
     }
 
     // Check if file is stored in local fallback storage
@@ -364,17 +479,13 @@ app.post('/api/record-file', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'بيانات التسجيل غير مكتملة' });
     }
 
-    const hasDb = process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '';
-    const publicId = hasDb
-      ? generatePublicId()
-      : encodeFileToken({
-          tf: fileId,
-          fn: originalFilename,
-          sz: Number(fileSize) || 0,
-          ch: chatId || '-1003839994672',
-          ms: Number(messageId) || 0,
-          mt: mimeType || 'application/octet-stream'
-        }) || generatePublicId();
+    let publicId = '';
+    if (messageId && Number(messageId) > 0) {
+      publicId = messageIdToShortCode(Number(messageId));
+    }
+    if (!publicId) {
+      publicId = generatePublicId();
+    }
 
     const { extension } = getFileExtensionAndName(originalFilename);
 
@@ -456,17 +567,13 @@ app.post('/api/upload/complete', async (req: Request, res: Response) => {
       ? chunkFileIds[0]
       : `chunks:${chunkFileIds.join(',')}`;
 
-    const hasDb = process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '';
-    const publicId = hasDb
-      ? generatePublicId()
-      : encodeFileToken({
-          tf: telegramFileId,
-          fn: filename,
-          sz: Number(fileSize) || 0,
-          ch: chatId || '-1003839994672',
-          ms: Number(messageId) || 0,
-          mt: mimeType || 'application/octet-stream'
-        }) || generatePublicId();
+    let publicId = '';
+    if (messageId && Number(messageId) > 0) {
+      publicId = messageIdToShortCode(Number(messageId));
+    }
+    if (!publicId) {
+      publicId = generatePublicId();
+    }
 
     const { extension } = getFileExtensionAndName(filename);
 
