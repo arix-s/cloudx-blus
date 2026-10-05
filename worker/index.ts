@@ -29,7 +29,7 @@ export default {
         JSON.stringify({
           status: 'online',
           service: 'CloudX Cloudflare Worker File Upload Backend',
-          version: '1.0.0'
+          version: '2.0.0'
         }),
         {
           status: 200,
@@ -80,7 +80,7 @@ export default {
         tgFormData.append('chat_id', chatId);
         tgFormData.append('document', file, file.name);
 
-        // Forward stream directly to Telegram Bot API
+        // Forward directly to Telegram Bot API (streaming - no buffering needed by CF Workers)
         const tgResponse = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
           method: 'POST',
           body: tgFormData

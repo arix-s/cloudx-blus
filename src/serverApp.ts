@@ -22,13 +22,15 @@ import {
 
 const app = express();
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Increase JSON/urlencoded body limits for large chunk metadata
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.get('/favicon.ico', (req: Request, res: Response) => {
   const faviconPath = path.resolve(process.cwd(), 'public', 'favicon.svg');
   if (fs.existsSync(faviconPath)) {
     res.setHeader('Content-Type', 'image/svg+xml');
+    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
     return res.sendFile(faviconPath);
   }
   res.status(204).end();
@@ -55,8 +57,24 @@ const storage = multer.diskStorage({
   }
 });
 
+// No file size limit on multer - allow unlimited uploads
 const upload = multer({
   storage: storage
+});
+
+// Chunk upload storage: use disk to avoid loading into memory
+const chunkTmpDir = getWritableDir('tmp');
+const chunkDiskStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, chunkTmpDir);
+  },
+  filename: (req, file, cb) => {
+    const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, 'chunk_' + unique + '-' + file.originalname);
+  }
+});
+const uploadChunk = multer({
+  storage: chunkDiskStorage
 });
 
 // Initialize database
@@ -80,6 +98,50 @@ function getFileExtensionAndName(originalName: string): { extension: string; saf
     extension: ext,
     safeName: `${safeBaseName}${ext}`
   };
+}
+
+/**
+ * Generates ETag from file record for caching
+ */
+function generateETag(fileRecord: StoredFile): string {
+  return `"${fileRecord.id}-${fileRecord.file_size}-${new Date(fileRecord.created_at).getTime()}"`;
+}
+
+/**
+ * Sets common caching headers for served files
+ */
+function setCacheHeaders(res: Response, fileRecord: StoredFile) {
+  const etag = generateETag(fileRecord);
+  // Files are immutable once uploaded (content doesn't change) - cache aggressively
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('ETag', etag);
+  // Set Last-Modified
+  res.setHeader('Last-Modified', new Date(fileRecord.created_at).toUTCString());
+}
+
+/**
+ * Check if client already has a fresh cached copy (304 Not Modified)
+ */
+function checkFreshCache(req: Request, res: Response, fileRecord: StoredFile): boolean {
+  const etag = generateETag(fileRecord);
+  const ifNoneMatch = req.headers['if-none-match'];
+  const ifModifiedSince = req.headers['if-modified-since'];
+
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    res.status(304).end();
+    return true;
+  }
+
+  if (ifModifiedSince) {
+    const clientDate = new Date(ifModifiedSince).getTime();
+    const fileDate = new Date(fileRecord.created_at).getTime();
+    if (fileDate <= clientDate) {
+      res.status(304).end();
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function renderOpenGraphPreviewHtml(fileRecord: StoredFile, fileWithExt: string, reqHost: string, protocol: string): string {
@@ -148,9 +210,9 @@ function renderOpenGraphPreviewHtml(fileRecord: StoredFile, fileWithExt: string,
 
       <!-- Player / Media Content -->
       <div class="my-6 flex justify-center items-center bg-slate-950/60 rounded-xl p-4 border border-slate-800/80 min-h-[220px]">
-        ${isImage ? `<img src="${fullRawUrl}" alt="${title}" class="max-h-[65vh] rounded-lg object-contain shadow-lg" />` : ''}
-        ${isVideo ? `<video controls autoplay class="w-full max-h-[65vh] rounded-lg shadow-lg" src="${fullRawUrl}"></video>` : ''}
-        ${isAudio ? `<div class="w-full p-4 text-center"><div class="text-4xl mb-4">🎵</div><audio controls class="w-full" src="${fullRawUrl}"></audio></div>` : ''}
+        ${isImage ? `<img src="${fullRawUrl}" alt="${title}" class="max-h-[65vh] rounded-lg object-contain shadow-lg" loading="lazy" decoding="async" />` : ''}
+        ${isVideo ? `<video controls preload="metadata" class="w-full max-h-[65vh] rounded-lg shadow-lg" src="${fullRawUrl}"></video>` : ''}
+        ${isAudio ? `<div class="w-full p-4 text-center"><div class="text-4xl mb-4">🎵</div><audio controls preload="metadata" class="w-full" src="${fullRawUrl}"></audio></div>` : ''}
         ${!isImage && !isVideo && !isAudio ? `<div class="text-center p-8"><div class="text-5xl mb-3">📁</div><p class="text-slate-300 font-medium">${fileRecord.original_filename}</p><p class="text-xs text-slate-500 mt-1">${fileRecord.mime_type}</p></div>` : ''}
       </div>
 
@@ -242,6 +304,11 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
       return res.status(200).send(renderOpenGraphPreviewHtml(fileRecord, fileWithExt, reqHost, protocol));
     }
 
+    // Check if client cache is still fresh (304 Not Modified)
+    if (checkFreshCache(req, res, fileRecord)) {
+      return;
+    }
+
     // Check if file is stored in local fallback storage
     if (fileRecord.telegram_file_id.startsWith('local:')) {
       const localFileName = fileRecord.telegram_file_id.substring(6);
@@ -258,6 +325,7 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
 
       res.setHeader('Content-Type', fileRecord.mime_type || 'application/octet-stream');
       res.setHeader('Accept-Ranges', 'bytes');
+      setCacheHeaders(res, fileRecord);
       res.setHeader(
         'Content-Disposition',
         isDownload
@@ -270,6 +338,13 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
         const parts = range.replace(/bytes=/, '').split('-');
         const start = parseInt(parts[0], 10);
         const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+        // Validate range
+        if (start >= fileSize || end >= fileSize || start > end) {
+          res.writeHead(416, { 'Content-Range': `bytes */${fileSize}` });
+          return res.end();
+        }
+
         const chunksize = end - start + 1;
 
         res.writeHead(206, {
@@ -298,6 +373,8 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
       const encodedFilename = encodeURIComponent(fileRecord.original_filename);
 
       res.setHeader('Content-Type', fileRecord.mime_type || 'application/octet-stream');
+      res.setHeader('Accept-Ranges', 'none');
+      setCacheHeaders(res, fileRecord);
       res.setHeader(
         'Content-Disposition',
         isDownload
@@ -348,6 +425,7 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
 
     res.setHeader('Content-Type', fileRecord.mime_type || 'application/octet-stream');
     res.setHeader('Accept-Ranges', 'bytes');
+    setCacheHeaders(res, fileRecord);
 
     const isDownload = req.query.download === '1';
     const encodedFilename = encodeURIComponent(fileRecord.original_filename);
@@ -437,23 +515,30 @@ app.get('/f/:fileWithExt', async (req: Request, res: Response) => {
 // 2. API ENDPOINTS
 // ----------------------------------------------------------------------
 
-const chunkStorage = multer.memoryStorage();
-const uploadChunk = multer({ storage: chunkStorage });
-
 // Local Cloudflare Worker simulation/proxy endpoint
 app.post('/api/worker-upload', uploadChunk.single('file'), async (req: Request, res: Response) => {
+  let tmpPath = '';
   try {
     const file = req.file;
     if (!file) {
       return res.status(400).json({ success: false, error: 'لم يتم العثور على أي ملف للرفع' });
     }
+    tmpPath = file.path;
 
     const { safeName } = getFileExtensionAndName(file.originalname || 'document.bin');
+    
+    // Stream file from disk instead of loading into memory
+    const fileBuffer = fs.readFileSync(file.path);
     const tgResult = await uploadFileToTelegram(
-      file.buffer,
+      fileBuffer,
       safeName,
       file.mimetype || 'application/octet-stream'
     );
+
+    // Clean up temp file
+    if (fs.existsSync(tmpPath)) {
+      try { fs.unlinkSync(tmpPath); } catch (e) {}
+    }
 
     return res.json({
       success: true,
@@ -465,6 +550,10 @@ app.post('/api/worker-upload', uploadChunk.single('file'), async (req: Request, 
       mimeType: file.mimetype
     });
   } catch (err: any) {
+    // Clean up temp file on error
+    if (tmpPath && fs.existsSync(tmpPath)) {
+      try { fs.unlinkSync(tmpPath); } catch (e) {}
+    }
     console.error('Error in worker upload endpoint:', err);
     return res.status(500).json({ success: false, error: 'حدث خطأ في الخادم أثناء رفع الملف: ' + (err.message || String(err)) });
   }
@@ -528,21 +617,31 @@ app.post('/api/record-file', async (req: Request, res: Response) => {
   }
 });
 
-// Chunked Upload: 1. Upload 2MB Chunk directly to Stateless Storage (Telegram)
+// Chunked Upload: 1. Upload chunk to Stateless Storage (Telegram)
 app.post('/api/upload/chunk', uploadChunk.single('chunk'), async (req: Request, res: Response) => {
+  let tmpPath = '';
   try {
     const rawChunkIndex = req.body?.chunkIndex !== undefined ? req.body.chunkIndex : req.headers['x-chunk-index'];
     if (!req.file || rawChunkIndex === undefined || rawChunkIndex === null) {
       return res.status(400).json({ success: false, error: 'بيانات الجزء المرفوع غير مكتملة' });
     }
+    tmpPath = req.file.path;
     const chunkIndex = Number(rawChunkIndex);
 
     const { safeName } = getFileExtensionAndName(req.file.originalname || 'part.bin');
+    
+    // Read from disk (not memory) to avoid OOM on large chunks
+    const chunkBuffer = fs.readFileSync(req.file.path);
     const tgResult = await uploadFileToTelegram(
-      req.file.buffer,
+      chunkBuffer,
       `part_${chunkIndex}_${safeName}`,
       req.file.mimetype || 'application/octet-stream'
     );
+
+    // Clean up temp file
+    if (fs.existsSync(tmpPath)) {
+      try { fs.unlinkSync(tmpPath); } catch (e) {}
+    }
 
     return res.json({
       success: true,
@@ -550,6 +649,10 @@ app.post('/api/upload/chunk', uploadChunk.single('chunk'), async (req: Request, 
       fileId: tgResult.fileId
     });
   } catch (err: any) {
+    // Clean up temp file on error
+    if (tmpPath && fs.existsSync(tmpPath)) {
+      try { fs.unlinkSync(tmpPath); } catch (e) {}
+    }
     console.error('Error uploading chunk:', err);
     return res.status(500).json({ success: false, error: 'فشل حفظ جزء الملف: ' + (err.message || String(err)) });
   }
@@ -806,6 +909,9 @@ app.get('/api/stats', async (req: Request, res: Response) => {
     const files = await getAllFiles();
     const totalCount = files.length;
     const totalBytes = files.reduce((acc, f) => acc + (f.file_size || 0), 0);
+
+    // Cache stats for 30 seconds
+    res.setHeader('Cache-Control', 'public, max-age=30');
 
     return res.json({
       success: true,

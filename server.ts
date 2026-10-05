@@ -23,8 +23,16 @@ if (process.env.NODE_ENV !== 'production') {
   });
   app.use(vite.middlewares);
 } else {
-  app.use(express.static(path.resolve(__dirname, 'dist')));
+  // Serve static assets with aggressive caching (hashed filenames are immutable)
+  app.use(express.static(path.resolve(__dirname, 'dist'), {
+    maxAge: '1y',
+    immutable: true,
+    etag: true,
+    lastModified: true,
+  }));
   app.get('*', (req, res) => {
+    // HTML files should not be cached aggressively (they reference hashed assets)
+    res.setHeader('Cache-Control', 'no-cache');
     res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
   });
 }

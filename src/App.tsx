@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   UploadCloud,
   FileText,
@@ -51,6 +51,28 @@ interface AdminFileInfo {
   relativePath: string;
 }
 
+interface UploadStats {
+  bytesUploaded: number;
+  totalBytes: number;
+  speedBps: number;
+  startTime: number;
+}
+
+function formatSpeed(bytesPerSecond: number): string {
+  if (bytesPerSecond <= 0) return '0 B/s';
+  if (bytesPerSecond < 1024) return `${bytesPerSecond.toFixed(0)} B/s`;
+  if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(2)} MB/s`;
+}
+
+function formatSizeCompact(bytes: number): string {
+  if (bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'upload' | 'login'>('upload');
   const [fileToUpload, setFileToUpload] = useState<File | null>(null);
@@ -60,6 +82,8 @@ export default function App() {
   const [uploadedResult, setUploadedResult] = useState<UploadedFileInfo | null>(null);
   const [isCopied, setIsCopied] = useState<boolean>(false);
   const [dragActive, setDragActive] = useState<boolean>(false);
+  const [uploadStats, setUploadStats] = useState<UploadStats | null>(null);
+  const [uploadPhase, setUploadPhase] = useState<string>('');
 
   // Stealth Login / Admin state
   const [userToken, setUserToken] = useState<string | null>(() => localStorage.getItem('cloudx_user_token'));
@@ -73,6 +97,10 @@ export default function App() {
 
   // App statistics
   const [stats, setStats] = useState<{ totalFiles: number; totalBytes: number } | null>(null);
+
+  // Abort controller for cancel support
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -212,110 +240,186 @@ export default function App() {
     setFileToUpload(file);
   };
 
+  /**
+   * Upload a single chunk via XHR with real progress tracking.
+   * Returns promise that resolves with parsed JSON response.
+   */
+  const uploadChunkWithProgress = (
+    url: string,
+    formData: FormData,
+    onProgress: (loaded: number, total: number) => void,
+    signal?: AbortSignal
+  ): Promise<any> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhrRef.current = xhr;
+      xhr.open('POST', url);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          onProgress(e.loaded, e.total);
+        }
+      };
+
+      xhr.onload = () => {
+        xhrRef.current = null;
+        try {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(JSON.parse(xhr.responseText));
+          } else {
+            let errMsg = `HTTP ${xhr.status}`;
+            try {
+              const errObj = JSON.parse(xhr.responseText);
+              if (errObj.error) errMsg = errObj.error;
+            } catch (e) {}
+            reject(new Error(errMsg));
+          }
+        } catch (e) {
+          reject(new Error('فشل في معالجة استجابة الخادم'));
+        }
+      };
+
+      xhr.onerror = () => {
+        xhrRef.current = null;
+        reject(new Error('فشل الاتصال بالخادم'));
+      };
+
+      xhr.ontimeout = () => {
+        xhrRef.current = null;
+        reject(new Error('انتهت مهلة الاتصال'));
+      };
+
+      // Support abort via signal
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          xhr.abort();
+          xhrRef.current = null;
+          reject(new Error('تم إلغاء الرفع'));
+        });
+      }
+
+      xhr.send(formData);
+    });
+  };
+
   const handleUpload = async () => {
     if (!fileToUpload) return;
 
     setIsUploading(true);
-    setUploadProgress(1);
+    setUploadProgress(0);
     setUploadError(null);
+    setUploadPhase('جاري التحضير...');
+    
+    const abortController = new AbortController();
+    uploadAbortRef.current = abortController;
 
     const file = fileToUpload;
     const workerEndpoint =
       import.meta.env.VITE_CF_WORKER_URL ||
       'https://cloudx-blus.mhmdbasht588.workers.dev';
 
-    const CHUNK_SIZE = 15 * 1024 * 1024; // 15MB chunks to ensure every Telegram chunk is < 20MB limit
+    const CHUNK_SIZE = 15 * 1024 * 1024; // 15MB chunks
+    const uploadStartTime = Date.now();
+
+    const updateStats = (bytesUploaded: number, totalBytes: number) => {
+      const elapsed = (Date.now() - uploadStartTime) / 1000;
+      const speedBps = elapsed > 0 ? bytesUploaded / elapsed : 0;
+      setUploadStats({
+        bytesUploaded,
+        totalBytes,
+        speedBps,
+        startTime: uploadStartTime,
+      });
+    };
 
     try {
       if (file.size <= CHUNK_SIZE) {
-        // Single File Upload
+        // ─── Single File Upload with real XHR progress ───
+        setUploadPhase('جاري الرفع إلى خوادم CloudX...');
         const formData = new FormData();
         formData.append('file', file, file.name);
 
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', workerEndpoint);
-
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            const percent = Math.round((e.loaded / e.total) * 95);
+        const data = await uploadChunkWithProgress(
+          workerEndpoint,
+          formData,
+          (loaded, total) => {
+            // Progress 0-90% for actual upload
+            const percent = Math.round((loaded / total) * 90);
             setUploadProgress(percent);
-          }
-        };
+            updateStats(loaded, file.size);
+          },
+          abortController.signal
+        );
 
-        xhr.onload = async () => {
-          try {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              const data = JSON.parse(xhr.responseText);
-              if (data.success && data.fileId) {
-                const recordRes = await fetch('/api/record-file', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    fileId: data.fileId,
-                    messageId: data.messageId,
-                    chatId: data.chatId,
-                    originalFilename: data.originalFilename || file.name,
-                    fileSize: data.fileSize || file.size,
-                    mimeType: data.mimeType || file.type
-                  })
-                });
+        if (!data.success || !data.fileId) {
+          throw new Error(data.error || 'حدث خطأ أثناء الرفع عبر خادم Cloudflare Worker');
+        }
 
-                const recordData = await recordRes.json();
-                setUploadProgress(100);
+        // Record phase (90-99%)
+        setUploadPhase('جاري تسجيل الملف...');
+        setUploadProgress(92);
 
-                if (recordData.success && recordData.file) {
-                  setUploadedResult(recordData.file);
-                  setFileToUpload(null);
-                  fetchStats();
-                } else {
-                  setUploadError(recordData.error || 'حدث خطأ أثناء حفظ بيانات الملف المرفوع');
-                }
-              } else {
-                setUploadError(data.error || 'حدث خطأ أثناء الرفع عبر خادم Cloudflare Worker');
-              }
-            } else {
-              let errMsg = 'فشل الرفع إلى خادم Cloudflare Worker';
-              try {
-                const errObj = JSON.parse(xhr.responseText);
-                if (errObj.error) errMsg = errObj.error;
-              } catch (e) {}
-              setUploadError(errMsg);
-            }
-          } catch (e) {
-            console.error('Error handling worker upload response:', e);
-            setUploadError('حدث خطأ أثناء معالجة استجابة الخادم');
-          } finally {
-            setIsUploading(false);
-          }
-        };
+        const recordRes = await fetch('/api/record-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileId: data.fileId,
+            messageId: data.messageId,
+            chatId: data.chatId,
+            originalFilename: data.originalFilename || file.name,
+            fileSize: data.fileSize || file.size,
+            mimeType: data.mimeType || file.type
+          }),
+          signal: abortController.signal,
+        });
 
-        xhr.onerror = () => {
-          setUploadError('فشل الاتصال بخادم Cloudflare Worker، يرجى التحقق من الشبكة والمحاولة لاحقاً');
-          setIsUploading(false);
-        };
+        const recordData = await recordRes.json();
 
-        xhr.send(formData);
+        if (recordData.success && recordData.file) {
+          setUploadProgress(100);
+          setUploadPhase('تم الرفع بنجاح!');
+          updateStats(file.size, file.size);
+          setUploadedResult(recordData.file);
+          setFileToUpload(null);
+          fetchStats();
+        } else {
+          throw new Error(recordData.error || 'حدث خطأ أثناء حفظ بيانات الملف المرفوع');
+        }
       } else {
-        // Multi-chunk upload for large files (> 15MB)
+        // ─── Multi-chunk upload for large files (> 15MB) with per-chunk progress ───
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
         const chunkFileIds: string[] = [];
         let lastChatId = '-1003839994672';
         let lastMessageId = 0;
+        let totalBytesUploaded = 0;
 
         for (let i = 0; i < totalChunks; i++) {
+          if (abortController.signal.aborted) {
+            throw new Error('تم إلغاء الرفع');
+          }
+
           const start = i * CHUNK_SIZE;
           const end = Math.min(file.size, start + CHUNK_SIZE);
           const chunkBlob = file.slice(start, end);
+          const chunkSize = end - start;
+
+          setUploadPhase(`جاري رفع الجزء ${i + 1} من ${totalChunks}...`);
 
           const formData = new FormData();
           formData.append('file', chunkBlob, `part_${i + 1}_${file.name}`);
 
-          const res = await fetch(workerEndpoint, {
-            method: 'POST',
-            body: formData
-          });
+          const data = await uploadChunkWithProgress(
+            workerEndpoint,
+            formData,
+            (loaded, total) => {
+              const currentUploaded = totalBytesUploaded + loaded;
+              const overallPercent = Math.round((currentUploaded / file.size) * 90);
+              setUploadProgress(Math.min(overallPercent, 90));
+              updateStats(currentUploaded, file.size);
+            },
+            abortController.signal
+          );
 
-          const data = await res.json();
           if (!data.success || !data.fileId) {
             throw new Error(data.error || `فشل رفع الجزء رقم ${i + 1}`);
           }
@@ -324,11 +428,13 @@ export default function App() {
           if (data.chatId) lastChatId = data.chatId;
           if (data.messageId) lastMessageId = data.messageId;
 
-          const progressPercent = Math.round(((i + 1) / totalChunks) * 95);
-          setUploadProgress(progressPercent);
+          totalBytesUploaded += chunkSize;
         }
 
-        // Complete chunked upload
+        // Complete chunked upload (90-100%)
+        setUploadPhase('جاري تجميع أجزاء الملف...');
+        setUploadProgress(92);
+
         const completeRes = await fetch('/api/upload/complete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -339,26 +445,55 @@ export default function App() {
             fileSize: file.size,
             chatId: lastChatId,
             messageId: lastMessageId
-          })
+          }),
+          signal: abortController.signal,
         });
 
         const completeData = await completeRes.json();
-        setUploadProgress(100);
 
         if (completeData.success && completeData.file) {
+          setUploadProgress(100);
+          setUploadPhase('تم الرفع بنجاح!');
+          updateStats(file.size, file.size);
           setUploadedResult(completeData.file);
           setFileToUpload(null);
           fetchStats();
         } else {
-          setUploadError(completeData.error || 'حدث خطأ أثناء حظر أجزاء الملف المرفوع');
+          throw new Error(completeData.error || 'حدث خطأ أثناء تجميع أجزاء الملف المرفوع');
         }
-        setIsUploading(false);
       }
     } catch (err: any) {
-      console.error('Upload catch error:', err);
-      setUploadError(err.message || 'فشل الاتصال بالخادم، يرجى المحاولة لاحقاً');
+      if (err.name !== 'AbortError' && err.message !== 'تم إلغاء الرفع') {
+        console.error('Upload catch error:', err);
+        setUploadError(err.message || 'فشل الاتصال بالخادم، يرجى المحاولة لاحقاً');
+      }
+    } finally {
       setIsUploading(false);
+      uploadAbortRef.current = null;
+      xhrRef.current = null;
     }
+  };
+
+  const handleRetryUpload = () => {
+    setUploadError(null);
+    setUploadProgress(0);
+    setUploadStats(null);
+    setUploadPhase('');
+    handleUpload();
+  };
+
+  const handleCancelUpload = () => {
+    if (uploadAbortRef.current) {
+      uploadAbortRef.current.abort();
+    }
+    if (xhrRef.current) {
+      xhrRef.current.abort();
+    }
+    setIsUploading(false);
+    setUploadProgress(0);
+    setUploadStats(null);
+    setUploadPhase('');
+    setUploadError(null);
   };
 
   const copyToClipboard = (text: string) => {
@@ -390,6 +525,27 @@ export default function App() {
       default:
         return <File className="w-8 h-8 text-slate-400" />;
     }
+  };
+
+  /** Render inline thumbnail for admin file list - lazy loaded */
+  const renderAdminThumbnail = (file: AdminFileInfo) => {
+    const category = getFileCategory(file.file_extension, file.mime_type);
+    if (category === 'image') {
+      return (
+        <img
+          src={`${file.relativePath}?raw=1`}
+          alt={file.original_filename}
+          loading="lazy"
+          decoding="async"
+          className="w-8 h-8 rounded object-cover bg-slate-800"
+          onError={(e) => {
+            (e.target as HTMLImageElement).style.display = 'none';
+            (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
+          }}
+        />
+      );
+    }
+    return null;
   };
 
   return (
@@ -517,32 +673,68 @@ export default function App() {
                 )}
               </div>
 
-              {/* Upload Error Message */}
+              {/* Upload Error Message with Retry */}
               {uploadError && (
-                <div className="mt-4 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-center gap-3 text-rose-300 text-xs leading-relaxed">
-                  <AlertTriangle className="w-5 h-5 shrink-0 text-rose-400" />
-                  <span>{uploadError}</span>
+                <div className="mt-4 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs leading-relaxed">
+                  <div className="flex items-center gap-3">
+                    <AlertTriangle className="w-5 h-5 shrink-0 text-rose-400" />
+                    <span className="flex-1">{uploadError}</span>
+                  </div>
+                  {fileToUpload && (
+                    <button
+                      onClick={handleRetryUpload}
+                      className="mt-3 w-full py-2 px-4 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 font-medium text-xs transition-all flex items-center justify-center gap-2 border border-rose-500/30"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>إعادة المحاولة</span>
+                    </button>
+                  )}
                 </div>
               )}
 
-              {/* Upload Progress Bar */}
+              {/* Upload Progress Bar - Enhanced with real stats */}
               {isUploading && (
-                <div className="mt-6 space-y-2">
-                  <div className="flex justify-between text-xs font-medium text-slate-300">
-                    <span>جاري الرفع إلى خوادم CloudX...</span>
-                    <span>{uploadProgress}%</span>
+                <div className="mt-6 space-y-3">
+                  <div className="flex justify-between items-center text-xs font-medium text-slate-300">
+                    <span>{uploadPhase}</span>
+                    <span className="font-mono tabular-nums">{uploadProgress}%</span>
                   </div>
-                  <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                  <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
                     <div
-                      className="bg-gradient-to-r from-cyan-500 via-blue-500 to-indigo-500 h-full rounded-full transition-all duration-300"
+                      className="bg-gradient-to-r from-cyan-500 via-blue-500 to-indigo-500 h-full rounded-full transition-all duration-200 ease-out"
                       style={{ width: `${uploadProgress}%` }}
                     />
                   </div>
+                  
+                  {/* Upload speed and size stats */}
+                  {uploadStats && uploadStats.totalBytes > 0 && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400 font-mono tabular-nums">
+                      <span>
+                        {formatSizeCompact(uploadStats.bytesUploaded)} / {formatSizeCompact(uploadStats.totalBytes)}
+                      </span>
+                      <span>
+                        ⚡ {formatSpeed(uploadStats.speedBps)}
+                      </span>
+                      {uploadStats.speedBps > 0 && (
+                        <span>
+                          ⏱ ~{Math.max(1, Math.ceil((uploadStats.totalBytes - uploadStats.bytesUploaded) / uploadStats.speedBps))} ثانية متبقية
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Cancel button */}
+                  <button
+                    onClick={handleCancelUpload}
+                    className="w-full py-2 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 font-medium text-xs transition-all border border-slate-700"
+                  >
+                    إلغاء الرفع
+                  </button>
                 </div>
               )}
 
               {/* Action Buttons */}
-              {fileToUpload && !isUploading && (
+              {fileToUpload && !isUploading && !uploadError && (
                 <div className="mt-6 flex items-center gap-3">
                   <button
                     onClick={handleUpload}
@@ -642,8 +834,9 @@ export default function App() {
                         <div className="rounded-xl overflow-hidden bg-black border border-slate-800 max-h-96">
                           <video
                             controls
+                            preload="metadata"
                             className="w-full h-auto max-h-96 object-contain"
-                            src={uploadedResult.relativePath}
+                            src={`${uploadedResult.relativePath}?raw=1`}
                           >
                             متصفحك لا يدعم تشغيل الفيديو.
                           </video>
@@ -654,8 +847,10 @@ export default function App() {
                       return (
                         <div className="rounded-xl overflow-hidden bg-slate-950 p-2 border border-slate-800 flex justify-center max-h-80">
                           <img
-                            src={uploadedResult.relativePath}
+                            src={`${uploadedResult.relativePath}?raw=1`}
                             alt={uploadedResult.originalFilename}
+                            loading="lazy"
+                            decoding="async"
                             className="max-h-72 object-contain rounded"
                           />
                         </div>
@@ -664,7 +859,7 @@ export default function App() {
                     if (category === 'audio') {
                       return (
                         <div className="bg-slate-950 p-4 rounded-xl border border-slate-800">
-                          <audio controls className="w-full" src={uploadedResult.relativePath}>
+                          <audio controls preload="metadata" className="w-full" src={`${uploadedResult.relativePath}?raw=1`}>
                             متصفحك لا يدعم تشغيل الصوت.
                           </audio>
                         </div>
@@ -677,6 +872,7 @@ export default function App() {
                             src={uploadedResult.relativePath}
                             className="w-full h-full"
                             title="PDF Preview"
+                            loading="lazy"
                           />
                         </div>
                       );
